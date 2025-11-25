@@ -1,6 +1,5 @@
 // project/bpf/detect.c
-//
-// Renamed from trace_fqdrop.c
+
 // Detects packet drops via tracepoint and marks congestion state.
 
 #include "vmlinux.h"
@@ -10,7 +9,7 @@
 
 char LICENSE[] SEC("license") = "GPL";
 
-#define FAIRNESS_WINDOW_NS (2ULL * 1000000000ULL)   // 2 seconds
+#define FAIRNESS_WINDOW_NS (10ULL * 1000000000ULL)   // 2 seconds
 
 // --- MAPS ---
 
