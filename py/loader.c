@@ -1,17 +1,4 @@
 // project/loader.c
-//
-// C replacement for loader.py
-// - loads trace_fqdrop.bpf.o and tc_enforcer.bpf.o
-// - attaches kprobe to fq_codel_drop()
-// - attaches TC egress program
-// - pins maps so cgctl/stats can access them
-//
-// Build (example):
-//   gcc -O2 -Wall loader.c -o loader -lbpf -lelf -lz
-//
-// Run (as root):
-//   sudo ./loader --iface eth0
-
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,6 +28,28 @@ static void usage(const char *prog)
 {
     fprintf(stderr, "Usage: %s --iface IFACE\n", prog);
     exit(EXIT_FAILURE);
+}
+
+// Helper to write the interface index into trace_fqdrop's config_map
+static int configure_trace_map(struct bpf_object *obj, int ifindex)
+{
+    struct bpf_map *map = bpf_object__find_map_by_name(obj, "config_map");
+    if (!map) {
+        fprintf(stderr, "[!] Could not find 'config_map' in trace_fqdrop object\n");
+        return -1;
+    }
+
+    int map_fd = bpf_map__fd(map);
+    uint32_t key = 0;
+    uint32_t value = ifindex;
+
+    if (bpf_map_update_elem(map_fd, &key, &value, BPF_ANY) != 0) {
+        fprintf(stderr, "[!] Failed to update config_map with ifindex: %s\n", strerror(errno));
+        return -1;
+    }
+    
+    printf("[+] Configured trace filter for ifindex: %d\n", ifindex);
+    return 0;
 }
 
 static void pin_maps(struct bpf_object *fq_obj, struct bpf_object *tc_obj)
@@ -96,45 +105,37 @@ static void pin_maps(struct bpf_object *fq_obj, struct bpf_object *tc_obj)
     }
 }
 
-static struct bpf_link *attach_kprobe_fqdrop(struct bpf_object *obj)
+static struct bpf_link *attach_tracepoint_drop(struct bpf_object *obj)
 {
     struct bpf_program *prog;
     struct bpf_link *link;
     int err;
 
-    // Program name from trace_fqdrop.c: SEC("kprobe/fq_codel_drop")
-    // default name is "on_fq_codel_drop"
-    prog = bpf_object__find_program_by_name(obj, "on_fq_codel_drop");
+    // We look for the function name defined in the C file: "trace_skb_drop"
+    prog = bpf_object__find_program_by_name(obj, "trace_skb_drop");
     if (!prog) {
-        fprintf(stderr, "[!] Could not find program 'on_fq_codel_drop'\n");
+        fprintf(stderr, "[!] Could not find program 'trace_skb_drop'\n");
         return NULL;
     }
 
-    link = bpf_program__attach_kprobe(prog, false /* retprobe? */, "fq_codel_drop");
+    // Attach to the standard "skb:kfree_skb" tracepoint
+    link = bpf_program__attach_tracepoint(prog, "skb", "kfree_skb");
     if (!link) {
         err = -errno;
-        fprintf(stderr, "[!] Failed to attach kprobe to fq_codel_drop: %s\n",
+        fprintf(stderr, "[!] Failed to attach tracepoint skb:kfree_skb: %s\n",
                 strerror(-err));
         return NULL;
     }
 
-    printf("[+] Attached kprobe to fq_codel_drop\n");
+    printf("[+] Attached tracepoint to skb:kfree_skb\n");
     return link;
 }
 
-static int attach_tc_egress(struct bpf_object *obj, const char *ifname)
+static int attach_tc_egress(struct bpf_object *obj, const char *ifname, int ifindex)
 {
-    int ifindex = if_nametoindex(ifname);
-    if (!ifindex) {
-        fprintf(stderr, "Unknown interface '%s'\n", ifname);
-        return -1;
-    }
-
     struct bpf_program *prog;
     int prog_fd, err;
 
-    // program name from tc_enforcer.c: SEC("tc")
-    // function: int tc_cgroup_fair_enforcer(struct __sk_buff *skb)
     prog = bpf_object__find_program_by_name(obj, "tc_cgroup_fair_enforcer");
     if (!prog) {
         fprintf(stderr, "[!] Could not find program 'tc_cgroup_fair_enforcer'\n");
@@ -182,7 +183,7 @@ int main(int argc, char **argv)
     const char *ifname = NULL;
     int opt;
     struct bpf_object *fq_obj = NULL, *tc_obj = NULL;
-    struct bpf_link *kprobe_link = NULL;
+    struct bpf_link *trace_link = NULL;
     int err;
 
     static struct option long_opts[] = {
@@ -204,44 +205,54 @@ int main(int argc, char **argv)
 
     if (!ifname)
         usage(argv[0]);
+        
+    int ifindex = if_nametoindex(ifname);
+    if (!ifindex) {
+        fprintf(stderr, "Unknown interface '%s'\n", ifname);
+        return EXIT_FAILURE;
+    }
 
     libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
-    libbpf_set_print(NULL); // quiet, or pass a callback for debug
+    libbpf_set_print(NULL); 
 
+    // --- 1. Load Trace Object (Congestion Detector) ---
     printf("[*] Loading %s...\n", fqdrop_obj_path);
     fq_obj = bpf_object__open_file(fqdrop_obj_path, NULL);
-    if (!fq_obj)
-        die("bpf_object__open_file(trace_fqdrop)");
+    if (!fq_obj) die("bpf_object__open_file(trace_fqdrop)");
 
     err = bpf_object__load(fq_obj);
-    if (err)
-        die("bpf_object__load(trace_fqdrop)");
+    if (err) die("bpf_object__load(trace_fqdrop)");
 
     printf("[+] Loaded trace_fqdrop\n");
 
+    // --- 2. Load TC Object (Enforcer) ---
     printf("[*] Loading %s...\n", tc_obj_path);
     tc_obj = bpf_object__open_file(tc_obj_path, NULL);
-    if (!tc_obj)
-        die("bpf_object__open_file(tc_enforcer)");
+    if (!tc_obj) die("bpf_object__open_file(tc_enforcer)");
 
     err = bpf_object__load(tc_obj);
-    if (err)
-        die("bpf_object__load(tc_enforcer)");
+    if (err) die("bpf_object__load(tc_enforcer)");
 
     printf("[+] Loaded tc_enforcer\n");
 
-    // Pin maps so userland tools can read them
+    // --- 3. Pin Maps ---
     pin_maps(fq_obj, tc_obj);
 
-    // Attach kprobe to fq_codel_drop
-    kprobe_link = attach_kprobe_fqdrop(fq_obj);
-    if (!kprobe_link) {
-        fprintf(stderr, "[!] Failed to attach kprobe; exiting\n");
+    // --- 4. Configure Trace Filter ---
+    // Tell the tracepoint program which interface to watch
+    if (configure_trace_map(fq_obj, ifindex) != 0) {
         goto out;
     }
 
-    // Attach TC egress
-    err = attach_tc_egress(tc_obj, ifname);
+    // --- 5. Attach Tracepoint ---
+    trace_link = attach_tracepoint_drop(fq_obj);
+    if (!trace_link) {
+        fprintf(stderr, "[!] Failed to attach tracepoint; exiting\n");
+        goto out;
+    }
+
+    // --- 6. Attach TC Egress ---
+    err = attach_tc_egress(tc_obj, ifname, ifindex);
     if (err) {
         fprintf(stderr, "[!] Failed to attach TC egress; exiting\n");
         goto out;
@@ -253,8 +264,8 @@ int main(int argc, char **argv)
     }
 
 out:
-    if (kprobe_link)
-        bpf_link__destroy(kprobe_link);
+    if (trace_link)
+        bpf_link__destroy(trace_link);
     if (tc_obj)
         bpf_object__close(tc_obj);
     if (fq_obj)

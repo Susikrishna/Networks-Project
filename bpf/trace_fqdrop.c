@@ -1,28 +1,22 @@
 // project/bpf/trace_fqdrop.c
-//
-// Trace fq_codel packet drops and mark "local congestion" state
-// so the TC egress program can enforce fairness.
-//
-// This file is CO-RE compatible and should be compiled with clang + libbpf.
-//
-// NOTE: Kernel symbol names may differ (fq_codel_drop / __fq_codel_drop)
-// You can check available symbols via:
-//     cat /proc/kallsyms | grep fq_codel
-
 #define __TARGET_ARCH_x86
 
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
+#include <bpf/bpf_core_read.h>
 
 char LICENSE[] SEC("license") = "GPL";
 
 #define FAIRNESS_WINDOW_NS (2ULL * 1000000000ULL)   // 2 seconds
 
+// --- MAPS ---
+
+// 1. Congestion State (Shared with TC Enforcer)
 struct congestion_state {
     __u64 active;        // 1 = fairness mode active, 0 = off
     __u64 expiry_ns;     // timestamp when fairness mode should turn off
-    __u64 last_drop_ns;  // last time fq_codel dropped a packet
+    __u64 last_drop_ns;  // last time a packet was dropped
 };
 
 struct {
@@ -31,6 +25,18 @@ struct {
     __type(key, __u32);
     __type(value, struct congestion_state);
 } congestion_map SEC(".maps");
+
+// 2. Configuration Map (Filled by Loader)
+// We need this because Tracepoints are global. We must only count drops
+// that happen on the specific interface (wlan0) you selected.
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32); // The ifindex of wlan0
+} config_map SEC(".maps");
+
+// --- HELPER ---
 
 static __always_inline int mark_congestion(void)
 {
@@ -41,6 +47,7 @@ static __always_inline int mark_congestion(void)
     if (!st)
         return 0;
 
+    // Update state to indicate congestion is happening
     st->active       = 1;
     st->last_drop_ns = now;
     st->expiry_ns    = now + FAIRNESS_WINDOW_NS;
@@ -48,20 +55,30 @@ static __always_inline int mark_congestion(void)
     return 0;
 }
 
-// Attach to fq_codel drop function
-// If your kernel uses __fq_codel_drop, uncomment the alternative section below.
-SEC("kprobe/fq_codel_drop")
-int BPF_KPROBE(on_fq_codel_drop, void *sch, void *skb)
-{
-    return mark_congestion();
-}
+// --- PROGRAM ---
 
-/*
-// Optional alternative attach point:
-// Uncomment this if your kernel symbol is "__fq_codel_drop"
-// SEC("kprobe/__fq_codel_drop")
-// int BPF_KPROBE(on___fq_codel_drop, void *sch, void *skb)
-// {
-//     return mark_congestion();
-// }
-*/
+// Hook into the standard kernel event for "packet freed"
+// This catches fq_codel drops, tail drops, and driver drops.
+SEC("tracepoint/skb/kfree_skb")
+int trace_skb_drop(struct trace_event_raw_kfree_skb *ctx)
+{
+    // 1. Retrieve the pointer to the socket buffer (skb)
+    struct sk_buff *skb = (struct sk_buff *)ctx->skbaddr;
+    
+    // 2. Read the interface index from the skb
+    // We use BPF_CORE_READ for safety across kernel versions
+    u32 skb_ifindex = BPF_CORE_READ(skb, dev, ifindex);
+
+    // 3. Get the target interface index (configured by loader.c)
+    __u32 key = 0;
+    __u32 *target_ifindex = bpf_map_lookup_elem(&config_map, &key);
+
+    if (!target_ifindex) return 0;
+
+    // 4. Only trigger congestion logic if the drop happened on OUR interface
+    if (skb_ifindex == *target_ifindex) {
+        mark_congestion();
+    }
+
+    return 0;
+}
