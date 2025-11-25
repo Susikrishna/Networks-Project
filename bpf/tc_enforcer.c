@@ -12,10 +12,19 @@
 //   tc filter add dev <iface> egress bpf da obj tc_enforcer.bpf.o sec tc
 //
 
+#define __TARGET_ARCH_x86
+
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_tracing.h>
+#define TC_ACT_UNSPEC  (-1)
+#define TC_ACT_OK       0
+#define TC_ACT_SHOT     2
+#define TC_ACT_STOLEN   4
+#define TC_ACT_QUEUED   3
+#define TC_ACT_REPEAT   6
+#define TC_ACT_REDIRECT 7
 
 char LICENSE[] SEC("license") = "GPL";
 
