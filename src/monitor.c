@@ -1,13 +1,13 @@
-// project/stats.c
+// src/monitor.c
 //
-// C replacement for stats.py
+// Renamed from stats.c
 // Live view of cg_stats_map every 1s.
 //
 // Build:
-//   gcc -O2 -Wall stats.c -o stats -lbpf
+//   gcc -O2 -Wall src/monitor.c -o bin/monitor -lbpf
 //
 // Run (as root):
-//   ./stats
+//   sudo ./bin/monitor
 
 #define _GNU_SOURCE
 #include <stdio.h>

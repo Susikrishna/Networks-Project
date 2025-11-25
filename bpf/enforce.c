@@ -1,41 +1,29 @@
-// project/bpf/tc_enforcer.c
+// project/bpf/enforce.c
 //
-// TC egress classifier that:
-//   - Reads congestion state set by trace_fqdrop.c
-//   - When local congestion is active, enforces per-cgroup
-//     token-bucket rate limiting before packets hit fq_codel.
-//
-// Compile with clang + libbpf (CO-RE style).
-//
-// Attach example (from userspace via tc):
-//   tc qdisc add dev <iface> clsact
-//   tc filter add dev <iface> egress bpf da obj tc_enforcer.bpf.o sec tc
-//
-
-#define __TARGET_ARCH_x86
+// Renamed from tc_enforcer.c
+// Enforces Token Bucket rate limiting per CGroup when congestion is detected.
 
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_tracing.h>
-#define TC_ACT_UNSPEC  (-1)
+
+// TC Return Codes
 #define TC_ACT_OK       0
 #define TC_ACT_SHOT     2
-#define TC_ACT_STOLEN   4
-#define TC_ACT_QUEUED   3
-#define TC_ACT_REPEAT   6
-#define TC_ACT_REDIRECT 7
 
 char LICENSE[] SEC("license") = "GPL";
 
-// Must match struct defined in trace_fqdrop.c
+// --- MAPS & STRUCTS ---
+
+// 1. Congestion State (Shared with detect.c)
+// Must match the definition in project/bpf/detect.c
 struct congestion_state {
     __u64 active;        // 1 = fairness mode active, 0 = off
     __u64 expiry_ns;     // when to stop fairness mode
-    __u64 last_drop_ns;  // last fq_codel drop timestamp
+    __u64 last_drop_ns;  // last drop timestamp
 };
 
-// Global congestion map shared with trace_fqdrop.c
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
@@ -43,7 +31,7 @@ struct {
     __type(value, struct congestion_state);
 } congestion_map SEC(".maps");
 
-// Per-cgroup token bucket state
+// 2. Per-cgroup token bucket state
 struct cg_bucket {
     __u64 last_ts_ns;        // last time tokens were updated
     __s64 tokens;            // current tokens (bytes)
@@ -52,7 +40,7 @@ struct cg_bucket {
     __u32 pad;
 };
 
-// Per-cgroup statistics
+// 3. Per-cgroup statistics
 struct cg_stats {
     __u64 bytes_passed;
     __u64 bytes_dropped;
@@ -74,10 +62,11 @@ struct {
     __type(value, struct cg_stats);
 } cg_stats_map SEC(".maps");
 
-// Default parameters — can be overridden from userspace by updating cg_buckets.
-// These are conservative starting values.
+// Default parameters — can be overridden from userspace (cli)
 #define DEFAULT_RATE_BYTES_PER_S  1250000ULL   // ~10 Mbit/s per cgroup
 #define DEFAULT_BURST_BYTES       65536U       // 64 KB burst
+
+// --- HELPERS ---
 
 static __always_inline int is_fairness_active(void)
 {
@@ -93,7 +82,7 @@ static __always_inline int is_fairness_active(void)
         return 0;
 
     if (now > st->expiry_ns) {
-        // Fairness window expired, optionally turn it off.
+        // Fairness window expired, turn it off lazy-style
         st->active = 0;
         return 0;
     }
@@ -133,13 +122,13 @@ static __always_inline int enforce_cgroup_bucket(__u64 cg_id, __u32 len)
     b = bpf_map_lookup_elem(&cg_buckets, &cg_id);
     if (!b) {
         // First time we see this cgroup — initialize with defaults.
-        init.last_ts_ns      = now;
-        init.tokens          = (__s64)DEFAULT_BURST_BYTES;
+        init.last_ts_ns       = now;
+        init.tokens           = (__s64)DEFAULT_BURST_BYTES;
         init.rate_bytes_per_s = DEFAULT_RATE_BYTES_PER_S;
-        init.burst_bytes     = DEFAULT_BURST_BYTES;
+        init.burst_bytes      = DEFAULT_BURST_BYTES;
 
         if (bpf_map_update_elem(&cg_buckets, &cg_id, &init, BPF_NOEXIST) < 0)
-            goto allow; // If we can't create bucket, don't break traffic.
+            goto allow; 
 
         b = bpf_map_lookup_elem(&cg_buckets, &cg_id);
         if (!b)
@@ -150,7 +139,7 @@ static __always_inline int enforce_cgroup_bucket(__u64 cg_id, __u32 len)
     if (b->rate_bytes_per_s > 0) {
         __u64 delta_ns = now - b->last_ts_ns;
         if (delta_ns > 0) {
-            // added = rate_bytes_per_s * delta_ns / 1e9
+            // calc added tokens: (rate * time) / 1e9
             __u64 added = (b->rate_bytes_per_s * delta_ns) / 1000000000ULL;
             if (added > 0) {
                 __s64 new_tokens = b->tokens + (__s64)added;
@@ -162,14 +151,14 @@ static __always_inline int enforce_cgroup_bucket(__u64 cg_id, __u32 len)
         }
     }
 
-    // Do we have enough tokens to send this packet?
+    // Check balance
     if (b->tokens >= (__s64)len) {
         b->tokens -= (__s64)len;
         update_stats(cg_id, len, true);
-        return TC_ACT_OK;  // allow
+        return TC_ACT_OK;  // Allow
     }
 
-    // Not enough tokens → drop packet.
+    // Not enough tokens → Drop
     update_stats(cg_id, len, false);
     return TC_ACT_SHOT;
 
@@ -178,23 +167,29 @@ allow:
     return TC_ACT_OK;
 }
 
-// TC egress program
+// --- PROGRAM ---
+
 SEC("tc")
 int tc_cgroup_fair_enforcer(struct __sk_buff *skb)
 {
     __u32 len = skb->len;
     __u64 cg_id;
 
-    // If no local congestion → do nothing (fast path).
+    // 1. Check Global Congestion Flag
     if (!is_fairness_active())
         return TC_ACT_OK;
 
-    // Identify cgroup responsible for this traffic.
+    // 2. Identify CGroup
+    // Note: bpf_get_current_cgroup_id() in TC egress context works if
+    // the packet is processed in the context of the sending process.
+    // For forwarded packets or softirq contexts, this might need skb-based lookup.
     cg_id = bpf_get_current_cgroup_id();
+    
     if (!cg_id) {
-        // Could not determine cgroup — fail open.
+        // Fail open if we can't identify the owner
         return TC_ACT_OK;
     }
 
+    // 3. Apply Token Bucket
     return enforce_cgroup_bucket(cg_id, len);
 }
