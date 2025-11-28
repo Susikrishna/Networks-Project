@@ -1,6 +1,5 @@
 // project/cgctl.c
-//
-// C replacement for cgctl.py
+
 // Usage (as root):
 //   ./cgctl congestion
 //   ./cgctl buckets
@@ -53,7 +52,6 @@ static void die(const char *msg)
     exit(EXIT_FAILURE);
 }
 
-// --- NEW HELPER: Get monotonic time in nanoseconds ---
 static uint64_t get_time_ns(void)
 {
     struct timespec ts;
@@ -138,7 +136,6 @@ static void show_stats(void)
     close(fd);
 }
 
-// --- NEW FUNCTION: Set Weight ---
 static void set_weight(const char *cg_id_str, const char *weight_str)
 {
     int fd = bpf_obj_get(PIN_BUCKETS);
@@ -160,7 +157,6 @@ static void set_weight(const char *cg_id_str, const char *weight_str)
     // Calculate new rate based on default * weight
     uint64_t new_rate = (uint64_t)(DEFAULT_RATE_BYTES_PER_S * weight);
     uint32_t new_burst = DEFAULT_BURST_BYTES; 
-    // Optional: scale burst with weight too? 
     // new_burst = (uint32_t)(DEFAULT_BURST_BYTES * weight);
 
     if (exists) {

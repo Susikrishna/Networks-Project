@@ -58,7 +58,7 @@ echo "[*] Creating Cgroups..."
 sudo mkdir -p /sys/fs/cgroup/A
 sudo mkdir -p /sys/fs/cgroup/B
 
-echo "[*] 🚀 LAUNCHING ATTACK..."
+echo "[*] LAUNCHING ATTACK..."
 echo "    Targeting 10mbit limit with 65KB packets..."
 
 # Group A: Nice user
@@ -82,9 +82,9 @@ echo ""
 echo ">>> DROPS & STATS <<<"
 sudo ./$BIN_DIR/cli stats
 
-echo ""
-echo ">>> KERNEL DROP VERIFICATION <<<"
-sudo tc -s qdisc show dev $IFACE | grep -A 2 "fq_codel"
+# echo ""
+# echo ">>> KERNEL DROP VERIFICATION <<<"
+# sudo tc -s qdisc show dev $IFACE | grep -A 2 "fq_codel"
 
 # --- 9. Cleanup ---
 echo ""

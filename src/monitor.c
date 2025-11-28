@@ -1,8 +1,5 @@
 // src/monitor.c
-//
-// Renamed from stats.c
-// Live view of cg_stats_map every 1s.
-//
+
 // Build:
 //   gcc -O2 -Wall src/monitor.c -o bin/monitor -lbpf
 //

@@ -1,6 +1,5 @@
 // project/bpf/enforce.c
-//
-// Renamed from tc_enforcer.c
+
 // Enforces Token Bucket rate limiting per CGroup when congestion is detected.
 
 #include "vmlinux.h"
@@ -180,9 +179,6 @@ int tc_cgroup_fair_enforcer(struct __sk_buff *skb)
         return TC_ACT_OK;
 
     // 2. Identify CGroup
-    // Note: bpf_get_current_cgroup_id() in TC egress context works if
-    // the packet is processed in the context of the sending process.
-    // For forwarded packets or softirq contexts, this might need skb-based lookup.
     cg_id = bpf_get_current_cgroup_id();
     
     if (!cg_id) {

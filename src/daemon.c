@@ -1,6 +1,5 @@
 // src/daemon.c
-//
-// Renamed from loader.c
+
 // Main background process that:
 // 1. Loads BPF programs (detect.bpf.o and enforce.bpf.o)
 // 2. Links them via a shared map (congestion_map)
@@ -39,7 +38,6 @@ static void usage(const char *prog)
     exit(EXIT_FAILURE);
 }
 
-// Write the interface index into detect.c's config_map
 static int configure_trace_map(struct bpf_object *obj, int ifindex)
 {
     struct bpf_map *map = bpf_object__find_map_by_name(obj, "config_map");
@@ -242,8 +240,6 @@ int main(int argc, char **argv)
     enforce_obj = bpf_object__open_file(enforce_obj_path, NULL);
     if (!enforce_obj) die("bpf_object__open_file(enforce)");
 
-    // CRITICAL: Share 'congestion_map' between objects
-    // We want enforce.c to read the SAME map that detect.c writes to.
     struct bpf_map *detect_map = bpf_object__find_map_by_name(detect_obj, "congestion_map");
     struct bpf_map *enforce_map = bpf_object__find_map_by_name(enforce_obj, "congestion_map");
 
